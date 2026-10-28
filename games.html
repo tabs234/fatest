@@ -743,6 +743,9 @@ you never need to touch this file's HTML to manage the game list.
     <section id="games" class="games-section">
         <div class="container">
             <h1 class="section-title">Games</h1>
+            <!-- ACCOUNTS: All / Favorites / Recently played tabs. Filled in and shown by the script
+                 below only when a user is logged in. Safe to leave even if accounts are removed. -->
+            <div id="viewTabs" class="sfca-viewtabs" hidden></div>
             
             <div class="games-grid" id="gamesGrid">
                 <div class="status-msg">Loading games…</div>
@@ -825,11 +828,23 @@ you never need to touch this file's HTML to manage the game list.
   let allGames = [];
   let searchTerm = '';
 
+  // ── ACCOUNTS ────────────────────────────────────────────────
+  // sfc-account.js is loaded separately (see the bottom of this script) so the
+  // games list NEVER depends on it: if that file is missing or fails to load, this
+  // page works exactly as it did before accounts existed (no hearts, no tabs).
+  let accountApi = null;   // set once sfc-account.js has loaded
+  let acct = { loggedIn: false, favorites: new Set(), recent: [] };
+  let view = 'all';        // 'all' | 'favs' | 'recent' (only used while logged in)
+  let gamesLoaded = false;
+  let refocusFavId = null; // keeps keyboard focus on a heart after the grid re-renders
+
   async function loadGames() {
     const grid = document.getElementById('gamesGrid');
     try {
       const snap = await getDoc(doc(db, 'site', 'sfc-games'));
       allGames = snap.exists() ? (snap.data().list || []) : [];
+      gamesLoaded = true;
+      renderViewTabs(); // favorites count needs the game list
     } catch (err) {
       console.error('Failed to load games from Firestore:', err);
       grid.innerHTML = '<div class="status-msg">Couldn\'t load games right now. Please refresh the page.</div>';
@@ -858,37 +873,72 @@ you never need to touch this file's HTML to manage the game list.
     }
   }
 
+  function renderViewTabs() {
+    const box = document.getElementById('viewTabs');
+    if (!box) return;
+    if (!acct.loggedIn) { box.hidden = true; box.innerHTML = ''; view = 'all'; return; }
+    const favCount = allGames.filter(g => acct.favorites.has(g.id)).length;
+    const tabs = [['all', 'All games'], ['favs', `♥ Favorites (${favCount})`], ['recent', '🕒 Recently played']];
+    box.innerHTML = tabs.map(([k, label]) =>
+      `<button type="button" class="sfca-chip${view === k ? ' active' : ''}" data-view="${k}" aria-pressed="${view === k}">${label}</button>`
+    ).join('');
+    box.hidden = false;
+  }
+
   function renderGrid() {
     const grid = document.getElementById('gamesGrid');
     const term = searchTerm.trim().toLowerCase();
-    const filtered = allGames
-      .filter(g => (g.name || '').toLowerCase().includes(term))
-      .sort((a, b) => badgeTier(b) - badgeTier(a));
+    let list = allGames.filter(g => (g.name || '').toLowerCase().includes(term));
 
-    if (filtered.length === 0) {
-      grid.innerHTML = '<div class="status-msg">No games found matching your search.</div>';
+    // Which slice of the list to show. Logged-out visitors always see everything.
+    const activeView = acct.loggedIn ? view : 'all';
+    if (activeView === 'favs') {
+      list = list.filter(g => acct.favorites.has(g.id)).sort((a, b) => badgeTier(b) - badgeTier(a));
+    } else if (activeView === 'recent') {
+      const order = acct.recent; // most recent first
+      list = list.filter(g => order.includes(g.id)).sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id));
+    } else {
+      list.sort((a, b) => badgeTier(b) - badgeTier(a));
+    }
+
+    if (list.length === 0) {
+      let msg = 'No games found matching your search.';
+      if (!term && activeView === 'favs') msg = 'No favorites yet — tap the ♡ on any game to save it here.';
+      else if (!term && activeView === 'recent') msg = 'Nothing here yet — games you play will show up here.';
+      grid.innerHTML = `<div class="status-msg">${msg}</div>`;
       return;
     }
 
-    grid.innerHTML = filtered.map(g => {
+    grid.innerHTML = list.map(g => {
       const badges = [
         g.isNew ? '<span class="awardshii-btn">New! ✨</span>' : '',
         g.isPop ? '<span class="hotgames-btn">Hot! 🔥</span>' : '',
         g.isFixed ? '<span class="fixed-btn">Fixed 🔨</span>' : '',
       ].join('');
+      const isFav = acct.favorites.has(g.id);
+      const heart = accountApi
+        ? `<button type="button" class="sfca-fav${isFav ? ' on' : ''}" data-id="${escapeHtml(g.id)}" aria-pressed="${isFav}" aria-label="${isFav ? 'Remove' : 'Add'} ${escapeHtml(g.name)} ${isFav ? 'from' : 'to'} favorites" title="${isFav ? 'Remove from favorites' : 'Add to favorites'}">${isFav ? '♥' : '♡'}</button>`
+        : '';
       return `
         <div class="game-card">
+          ${heart}
           <div class="game-image" style="background-image: url('${escapeHtml(g.img)}');"></div>
           <div class="game-info">
             <div class="game-info-top">
               <h3 class="game-title">${escapeHtml(g.name)}</h3>
               <div class="badges-row">${badges}</div>
             </div>
-            <a href="${escapeHtml(g.url)}" class="play-btn" target="_blank" rel="noopener">Play Now</a>
+            <a href="${escapeHtml(g.url)}" class="play-btn" data-id="${escapeHtml(g.id)}" target="_blank" rel="noopener">Play Now</a>
           </div>
         </div>
       `;
     }).join('');
+
+    if (refocusFavId) {
+      const again = [...grid.querySelectorAll('.sfca-fav')].find(el => el.dataset.id === refocusFavId);
+      refocusFavId = null;
+      if (again) again.focus();
+    }
   }
 
   function performSearch(query) {
@@ -916,12 +966,48 @@ you never need to touch this file's HTML to manage the game list.
           return;
         }
         const pick = playable[Math.floor(Math.random() * playable.length)];
+        if (accountApi && pick.id) accountApi.recordPlay(pick.id);
         window.open(pick.url, '_blank');
       });
     }
 
     loadGames();
     loadStatus();
+
+    // ── ACCOUNTS wiring ──────────────────────────────────────
+    const gridEl = document.getElementById('gamesGrid');
+    gridEl.addEventListener('click', (e) => {
+      if (!accountApi) return;
+      const heart = e.target.closest('.sfca-fav');
+      if (heart) {
+        refocusFavId = acct.loggedIn ? heart.dataset.id : null;
+        accountApi.toggleFavorite(heart.dataset.id); // logged out → opens the login dialog
+        return;
+      }
+      const play = e.target.closest('.play-btn');
+      if (play && play.dataset.id) accountApi.recordPlay(play.dataset.id);
+    });
+
+    const tabsBox = document.getElementById('viewTabs');
+    if (tabsBox) tabsBox.addEventListener('click', (e) => {
+      const chip = e.target.closest('.sfca-chip');
+      if (!chip) return;
+      view = chip.dataset.view;
+      renderViewTabs();
+      renderGrid();
+      const again = [...tabsBox.querySelectorAll('.sfca-chip')].find(c => c.dataset.view === view);
+      if (again) again.focus();
+    });
+
+    // Dynamic import on purpose: a missing/broken sfc-account.js must never stop the games from loading.
+    import('./sfc-account.js').then(mod => {
+      accountApi = mod;
+      mod.subscribe(snapshot => {
+        acct = snapshot;
+        renderViewTabs();
+        if (gamesLoaded) renderGrid();
+      });
+    }).catch(err => console.warn('Accounts unavailable — games still work without them.', err));
   });
 </script>
 </body>
